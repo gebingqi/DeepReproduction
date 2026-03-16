@@ -1,0 +1,30 @@
+|-用户输入CVE编号（接下来都以CVE-2022-28805）
+|
+|
+|-获取 https://api.osv.dev/v1/vulns/CVE-2022-28805（这是一个json文件）
+|
+|
+|-获取 id/details/published/affected
+|
+|
+|-获取references字段--|-寻找type为 'FIX'的url--|-若为github&commit，则获取url+.patch文件
+                     |                       |
+                     |                       |-其他
+                     |
+                     |-其他
+
+对于 '其他' 的url：使用search_web函数访问
+
+search_web函数（最多迭代三次，即references字段的url为第一层，references.url->son.url为第二层，references.url->son.url->grandson.url为第三层，不能继续向下访问下级链接）
+|
+|-过滤掉黑名单顶级域名
+|
+|-下载url
+|
+|-使用python库清洗html标签等信息
+|
+|-让大模型再次清洗该url（清理网站logo，slogan，与漏洞复现无关的信息及url）
+|
+|-保存二次清洗后的url为md
+|
+|-迭代访问其中的url
