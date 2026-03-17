@@ -1,0 +1,22 @@
+[project]
+name = "DeepReproduction"
+version = "0.0.1"
+description = "Vulnerability Reproduction Based on LLM Agents"
+authors = [
+]
+dependencies = [
+    "langchain>=0.2.2",
+    "python-dotenv>=1.0.1",
+    "GitPython>=3.1.43",
+    "Levenshtein>=0.25.1",
+    "langchain-openai>=0.1.8",
+    "rich>=13.7.1",
+    "PyYAML>=6.0.1",
+]
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "None"}
+
+
+[tool.pdm]
+distribution = false
