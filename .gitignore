@@ -1,3 +1,5 @@
 ﻿*.Identifier*
 __pycache__/
 *.py[cod]
+.venv/
+__pypackages__/
