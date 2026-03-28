@@ -1,1 +1,149 @@
 {# 文件说明：运行脚本模板。用于生成执行 PoC 或验证流程的标准运行脚本。 #}
+{#
+参考变量：
+- src_root: 源码根目录，默认 /src。
+- project_name: 可选，项目名字。若已从 task.yaml / knowledge.yaml / 资料收集结果确认，建议填入以保持与 Dockerfile.j2 一致。
+- project_dir_name: 源码在 /src 下的目录名。默认回退到 project_name，再回退到 target。
+- project_dir: 源码目录。默认由 src_root + project_dir_name 拼接得到。
+- run_mode: argv / stdin / none，默认 argv。
+- command_prefix: 运行目标及前置参数列表。待确认项，应根据实际可执行文件路径和调用方式填写；不要假设一定是 ./a.out。
+- command_suffix: 追加到命令尾部的参数列表。
+- asan_options: 运行时 ASan 配置，默认 detect_leaks=0。
+- error_patterns: 命中后视为“漏洞已触发”的错误特征列表。应优先来自 knowledge.expected_error_patterns、崩溃报告、sanitizer 日志或其他资料证据；不要默认写死成某一种漏洞类型。
+- stack_keywords: 可选的栈关键字列表；若提供，则需要和 error_patterns 同时命中。优先来自 knowledge.expected_stack_keywords 或崩溃栈证据；仅当这些关键字在证据中稳定出现时才填写，否则应留空以降低误判和漏判风险。
+- treat_nonzero_exit_as_trigger: 当程序非零退出时，是否也判定为触发。
+
+约定：
+- exit 1: 漏洞触发成功。
+- exit 0: 未触发漏洞，通常表示补丁态通过。
+- 该约定与 scripts/validation.py 的差分验证逻辑保持一致。
+#}
+{% set src_root = src_root | default("/src") %}
+{% set project_name = project_name | default("target") %}
+{% set project_dir_name = project_dir_name | default(project_name) %}
+{% set project_dir = project_dir | default(src_root ~ "/" ~ project_dir_name) %}
+{% set run_mode = run_mode | default("argv") %}
+{% set command_prefix = command_prefix | default(["__COMMAND_PREFIX_TO_BE_CONFIRMED__"]) %}
+{% set command_suffix = command_suffix | default([]) %}
+{% set asan_options = asan_options | default("detect_leaks=0") %}
+{% set default_error_patterns = ["__ERROR_PATTERN_TO_BE_CONFIRMED__"] %}
+{% set error_patterns = error_patterns | default(default_error_patterns) %}
+{% set error_patterns_need_confirmation = error_patterns == default_error_patterns %}
+{% set stack_keywords = stack_keywords | default([]) %}
+{% set treat_nonzero_exit_as_trigger = treat_nonzero_exit_as_trigger | default(false) %}
+#!/bin/bash
+set -euo pipefail
+
+log() {
+    printf '[run] %s\n' "$*" >&2
+}
+
+POC_FILE="${1:-}"
+if [[ "{{ run_mode }}" != "none" && -z "${POC_FILE}" ]]; then
+    echo "Usage: $0 <poc-file>" >&2
+    exit 2
+fi
+
+if [[ "{{ run_mode }}" != "none" && ! -f "${POC_FILE}" ]]; then
+    log "poc file does not exist: ${POC_FILE}"
+    exit 2
+fi
+
+export ASAN_OPTIONS="${ASAN_OPTIONS:-{{ asan_options }}}"
+
+if [[ ! -d "{{ project_dir }}" ]]; then
+    log "project_dir does not exist: {{ project_dir }}"
+    exit 2
+fi
+
+cd "{{ project_dir }}"
+
+COMMAND=(
+{% for item in command_prefix %}
+    "{{ item }}"
+{% endfor %}
+)
+
+if [[ "${#COMMAND[@]}" -eq 0 ]]; then
+    log "command_prefix is empty; please fill it from verified execution evidence"
+    exit 2
+fi
+
+if [[ "${COMMAND[0]}" == "__COMMAND_PREFIX_TO_BE_CONFIRMED__" ]]; then
+    log "command_prefix is not configured; please fill it from verified execution evidence"
+    exit 2
+fi
+
+{% if error_patterns_need_confirmation %}
+log "error_patterns is not configured; please fill it from verified crash evidence"
+exit 2
+{% endif %}
+
+{% if run_mode == "argv" %}
+COMMAND+=("${POC_FILE}")
+{% endif %}
+
+{% for item in command_suffix %}
+COMMAND+=("{{ item }}")
+{% endfor %}
+
+COMMAND_RENDERED="$(printf ' %q' "${COMMAND[@]}")"
+log "project_dir=$(pwd)"
+log "command=${COMMAND_RENDERED# }"
+
+set +e
+{% if run_mode == "stdin" %}
+OUTPUT=$("${COMMAND[@]}" < "${POC_FILE}" 2>&1)
+{% else %}
+OUTPUT=$("${COMMAND[@]}" 2>&1)
+{% endif %}
+STATUS=$?
+set -e
+
+echo "${OUTPUT}"
+log "command_exit_status=${STATUS}"
+
+TRIGGERED=0
+MATCHED_ERROR_PATTERN=""
+{% for pattern in error_patterns %}
+if grep -F -q -- "{{ pattern }}" <<<"${OUTPUT}"; then
+    TRIGGERED=1
+    MATCHED_ERROR_PATTERN="{{ pattern }}"
+    break
+fi
+{% endfor %}
+
+{% if stack_keywords %}
+STACK_MATCHED=0
+MATCHED_STACK_KEYWORD=""
+{% for keyword in stack_keywords %}
+if grep -F -q -- "{{ keyword }}" <<<"${OUTPUT}"; then
+    STACK_MATCHED=1
+    MATCHED_STACK_KEYWORD="{{ keyword }}"
+    break
+fi
+{% endfor %}
+if [[ "${TRIGGERED}" -eq 1 && "${STACK_MATCHED}" -eq 1 ]]; then
+    log "matched_error_pattern=${MATCHED_ERROR_PATTERN}"
+    log "matched_stack_keyword=${MATCHED_STACK_KEYWORD}"
+    echo "Exit:1"
+    exit 1
+fi
+{% else %}
+if [[ "${TRIGGERED}" -eq 1 ]]; then
+    log "matched_error_pattern=${MATCHED_ERROR_PATTERN}"
+    echo "Exit:1"
+    exit 1
+fi
+{% endif %}
+
+{% if treat_nonzero_exit_as_trigger %}
+if [[ "${STATUS}" -ne 0 ]]; then
+    log "treating non-zero exit status as trigger"
+    echo "Exit:1"
+    exit 1
+fi
+{% endif %}
+
+echo "Exit:0"
+exit 0

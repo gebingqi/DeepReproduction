@@ -1,1 +1,93 @@
 {# 文件说明：Dockerfile 模板。用于生成漏洞目标项目的基础构建环境。 #}
+{#
+参考变量：
+- repo_url: 漏洞目标仓库地址，必填。优先由 task.yaml / knowledge.yaml / 资料收集结果填写；默认占位值仅用于提醒“待确认”。
+- vulnerable_ref: 漏洞态 commit / tag / branch，必填。优先由 task.yaml / knowledge.yaml / 补丁前版本信息填写；若 FIX 提交已知且资料能定位其父提交或明确补丁前版本，应优先使用经证据核对后的漏洞态 SHA；不要默认使用浮动分支。
+- project_name: 可选，项目名字。优先根据 repo_url 的仓库名、task.yaml 或资料收集结果确认，例如 lua。
+- project_dir_name: 源码在 /src 下的目录名。应优先使用项目名字；默认回退到 project_name，再回退到 target。
+- base_image: 可选基础镜像。若资料能判断漏洞时间窗口、目标发行版或编译环境，优先选择与漏洞日期相近的 Ubuntu 版本；缺乏明确证据时再使用默认 ubuntu:20.04。
+- apt_packages / extra_apt_packages: apt 安装包列表。除通用工具链外，应优先补充从知识证据中识别出的 repo-specific 编译依赖，例如头文件库、解释器 dev 包或构建工具插件。
+- src_root: 源码根目录，默认 /src。
+- vulnspace_root: 漏洞工件根目录，默认 /vulnspace。
+- clone_submodules: 是否初始化 git submodule，默认 false。
+- extra_setup_commands: checkout 之后执行的额外准备命令列表。命令默认在 ${PROJECT_DIR} 内执行，建议保持可重复执行。
+- git_disable_ssl_verify: 是否关闭 git ssl 校验，默认 false。
+#}
+{% set base_image = base_image | default("ubuntu:20.04") %}
+{% set src_root = src_root | default("/src") %}
+{% set vulnspace_root = vulnspace_root | default("/vulnspace") %}
+{% set project_name = project_name | default("target") %}
+{% set project_dir_name = project_dir_name | default(project_name) %}
+{% set project_dir = project_dir | default(src_root ~ "/" ~ project_dir_name) %}
+{% set default_apt_packages = [
+    "autoconf",
+    "automake",
+    "build-essential",
+    "clang",
+    "cmake",
+    "curl",
+    "gdb",
+    "git",
+    "lld",
+    "llvm",
+    "make",
+    "pkg-config",
+    "python3",
+    "python3-pip",
+    "python3-venv",
+    "python3-yaml"
+] %}
+{% set apt_packages = apt_packages | default(default_apt_packages) %}
+{% set extra_apt_packages = extra_apt_packages | default([]) %}
+{% set clone_submodules = clone_submodules | default(false) %}
+{% set extra_setup_commands = extra_setup_commands | default([]) %}
+{% set git_disable_ssl_verify = git_disable_ssl_verify | default(false) %}
+FROM {{ base_image }}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV VULNSPACE={{ vulnspace_root }}
+ENV SRC_ROOT={{ src_root }}
+ENV PROJECT_DIR={{ project_dir }}
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends {{ (apt_packages + extra_apt_packages) | join(" ") }} && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p "${SRC_ROOT}" "${VULNSPACE}"
+
+{% if git_disable_ssl_verify %}
+RUN git config --global http.sslVerify false
+{% endif %}
+
+RUN set -eux; \
+    git clone "{{ repo_url | default("__REPO_URL_TO_BE_CONFIRMED__") }}" "${PROJECT_DIR}" && \
+    cd "${PROJECT_DIR}" && \
+    git checkout "{{ vulnerable_ref | default("__VULNERABLE_REF_TO_BE_CONFIRMED__") }}"{% if clone_submodules %} && \
+    git submodule update --init --recursive{% endif %} && \
+    git rev-parse HEAD
+
+{% for command in extra_setup_commands %}
+RUN set -eux; \
+    cd "${PROJECT_DIR}" && \
+    {{ command }}
+{% endfor %}
+
+# Build-context precondition:
+# - vuln_data/vuln_pocs
+# - vuln_data/vuln_reports
+# - vuln_data/vuln_scripts
+# - vuln_data/vuln_diffs
+# These directories should exist in the build context even when some of them are empty.
+
+COPY vuln_data/vuln_pocs ${VULNSPACE}/vuln_pocs
+COPY vuln_data/vuln_reports ${VULNSPACE}/vuln_reports
+COPY vuln_data/vuln_scripts ${VULNSPACE}/vuln_scripts
+COPY vuln_data/vuln_diffs ${VULNSPACE}/vuln_diffs
+
+RUN chmod +x ${VULNSPACE}/vuln_scripts/build.sh && \
+    chmod +x ${VULNSPACE}/vuln_scripts/run.sh
+
+WORKDIR ${PROJECT_DIR}

@@ -1,1 +1,99 @@
 {# 文件说明：构建脚本模板。用于生成编译漏洞目标项目的标准构建脚本。 #}
+{#
+参考变量：
+- src_root: 源码根目录，默认 /src。
+- project_name: 可选，项目名字。若已从 task.yaml / knowledge.yaml / 资料收集结果确认，建议填入以保持与 Dockerfile.j2 一致。
+- project_dir_name: 源码在 /src 下的目录名。默认回退到 project_name，再回退到 target。
+- project_dir: 源码目录。默认由 src_root + project_dir_name 拼接得到。
+- cc / cxx: 编译器，默认 clang / clang++。
+- sanitizer_flags: sanitizer 相关 flags，默认 ASan。
+- cflags / cxxflags / ldflags: 完整编译和链接参数。
+- clean_commands: 可选清理命令列表。差分验证场景下，优先清理目标二进制和中间产物，确保补丁前后可重复重编译。
+- configure_commands: 可选 configure / cmake / autoreconf 命令列表。
+- build_commands: 实际构建命令列表。待确认项，应根据源码中的 Makefile / CMakeLists.txt / configure.ac / meson.build 等证据填写，并优先保留目标仓库原生的构建变量接口（例如 MYCFLAGS / MYLDFLAGS），不要仅凭模板猜测替换成通用变量名。
+
+说明：
+- 模板默认围绕 C/C++ + sanitizer 编译。
+- 差分验证场景下，这个脚本需要可重复执行，既要适用于漏洞态，也要适用于补丁态。
+- 对 Lua 这类项目，可把 build_commands 改成使用 MYCFLAGS / MYLDFLAGS 的 make 调用；如果资料未明确，不要把默认流程写死成 make / cmake / ninja 中的任意一种。
+#}
+{% set src_root = src_root | default("/src") %}
+{% set project_name = project_name | default("target") %}
+{% set project_dir_name = project_dir_name | default(project_name) %}
+{% set project_dir = project_dir | default(src_root ~ "/" ~ project_dir_name) %}
+{% set sanitizer_flags = sanitizer_flags | default("-fsanitize=address -fno-omit-frame-pointer") %}
+{% set cc = cc | default("clang") %}
+{% set cxx = cxx | default("clang++") %}
+{% set cflags = cflags | default("-g -O0 " ~ sanitizer_flags) %}
+{% set cxxflags = cxxflags | default("-g -O0 " ~ sanitizer_flags) %}
+{% set ldflags = ldflags | default(sanitizer_flags) %}
+{% set clean_commands = clean_commands | default([]) %}
+{% set configure_commands = configure_commands | default([]) %}
+{% set build_commands = build_commands | default([
+    'echo "[build] build_commands 待确认：请根据源码中的构建入口填写 build_commands。" >&2',
+    'exit 2'
+]) %}
+#!/bin/bash
+set -euo pipefail
+
+# Reference template for sanitizer-enabled C/C++ rebuilds.
+# Keep this script idempotent so the validator can run it before and after
+# `git apply patch.diff`.
+
+log() {
+    printf '[build] %s\n' "$*" >&2
+}
+
+export CC="{{ cc }}"
+export CXX="{{ cxx }}"
+export SANITIZER_FLAGS="{{ sanitizer_flags }}"
+export CFLAGS="{{ cflags }}"
+export CXXFLAGS="{{ cxxflags }}"
+export LDFLAGS="{{ ldflags }}"
+
+if [[ ! -d "{{ project_dir }}" ]]; then
+    log "project_dir does not exist: {{ project_dir }}"
+    exit 2
+fi
+
+if ! command -v "${CC}" >/dev/null 2>&1; then
+    log "compiler not found: ${CC}"
+    exit 2
+fi
+
+if [[ -n "${CXX}" ]] && ! command -v "${CXX}" >/dev/null 2>&1; then
+    log "compiler not found: ${CXX}"
+    exit 2
+fi
+
+cd "{{ project_dir }}"
+
+log "project_dir=$(pwd)"
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    log "git_head=$(git rev-parse HEAD)"
+fi
+log "CC=${CC}"
+log "CXX=${CXX}"
+log "SANITIZER_FLAGS=${SANITIZER_FLAGS}"
+
+# Optional repo-specific cleanup.
+# Examples:
+# - rm -f *.o target_binary
+# - In differential verification workflows, prefer clearing both intermediate objects and final binaries.
+# - make clean || true
+log "running clean step"
+{% for command in clean_commands %}
+{{ command }}
+{% endfor %}
+
+# Optional configure / regenerate steps.
+log "running configure step"
+{% for command in configure_commands %}
+{{ command }}
+{% endfor %}
+
+# Main build commands.
+log "running build step"
+{% for command in build_commands %}
+{{ command }}
+{% endfor %}
