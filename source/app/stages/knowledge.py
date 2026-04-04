@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -129,6 +130,7 @@ class KnowledgeStage:
 
         try:
             task, bootstrap_error = self.bootstrap_task(cve_id=cve_id, paths=paths)
+            reset_stage_outputs(paths)
             write_yaml(paths.task_yaml, task.model_dump(mode="json"))
 
             selected_references, skipped_references = self.prioritize_references(
@@ -454,29 +456,37 @@ class KnowledgeStage:
         """Synthesize the final `knowledge.yaml` record."""
 
         summary_source = heuristic_summary_from_pages(fetched_pages)
+        heuristic_vuln_type = infer_vulnerability_type(summary_source)
+        heuristic_affected_files = dedupe_preserve_order(item for patch in patch_summaries for item in patch.affected_files)
+        heuristic_reproduction_hints = build_reproduction_hints(task, fetched_pages, patch_summaries)
+        heuristic_expected_stack_keywords = extract_stack_keywords(patch_summaries)
         llm_result = self._try_llm_synthesis(task, fetched_pages, patch_summaries)
         if llm_result is not None:
+            llm_result.summary = llm_result.summary or summary_source
+            llm_result.vulnerability_type = llm_result.vulnerability_type or heuristic_vuln_type
             llm_result.references = [record.url for record in source_registry.selected_references]
             llm_result.repo_url = llm_result.repo_url or task.repo_url
             llm_result.vulnerable_ref = llm_result.vulnerable_ref or task.vulnerable_ref
             llm_result.fixed_ref = llm_result.fixed_ref or task.fixed_ref
+            llm_result.affected_files = llm_result.affected_files or heuristic_affected_files
+            llm_result.reproduction_hints = llm_result.reproduction_hints or heuristic_reproduction_hints
+            llm_result.expected_stack_keywords = llm_result.expected_stack_keywords or heuristic_expected_stack_keywords
+            llm_result.expected_error_patterns = llm_result.expected_error_patterns or default_error_patterns(
+                llm_result.vulnerability_type or heuristic_vuln_type
+            )
             return llm_result
-
-        vuln_type = infer_vulnerability_type(summary_source)
-        affected_files = dedupe_preserve_order(item for patch in patch_summaries for item in patch.affected_files)
-        reproduction_hints = build_reproduction_hints(task, fetched_pages, patch_summaries)
 
         return KnowledgeModel(
             cve_id=task.cve_id,
             summary=summary_source,
-            vulnerability_type=vuln_type,
+            vulnerability_type=heuristic_vuln_type,
             repo_url=task.repo_url,
             vulnerable_ref=task.vulnerable_ref,
             fixed_ref=task.fixed_ref,
-            affected_files=affected_files,
-            reproduction_hints=reproduction_hints,
-            expected_error_patterns=default_error_patterns(vuln_type),
-            expected_stack_keywords=extract_stack_keywords(patch_summaries),
+            affected_files=heuristic_affected_files,
+            reproduction_hints=heuristic_reproduction_hints,
+            expected_error_patterns=default_error_patterns(heuristic_vuln_type),
+            expected_stack_keywords=heuristic_expected_stack_keywords,
             references=[record.url for record in source_registry.selected_references],
         )
 
@@ -758,6 +768,23 @@ def prepare_layout(paths: KnowledgePaths) -> None:
     paths.pocs_dir.mkdir(parents=True, exist_ok=True)
 
 
+def reset_stage_outputs(paths: KnowledgePaths) -> None:
+    """Clear stage-owned outputs before writing a fresh run."""
+
+    for directory in (paths.raw_dir, paths.cleaned_dir, paths.extracted_dir, paths.diff_dir, paths.pocs_dir):
+        if not directory.exists():
+            continue
+        for child in directory.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+
+    for path in (paths.knowledge_yaml, paths.runtime_state_yaml, paths.knowledge_sources_yaml):
+        if path.exists():
+            path.unlink()
+
+
 def build_runtime_state_payload(
     task_id: str,
     success: bool,
@@ -904,6 +931,10 @@ def should_follow_discovered_link(parent_url: str, child_url: str) -> bool:
     if child_parts.scheme not in {"http", "https"}:
         return False
 
+    lowered = child_url.lower()
+    if any(token in lowered for token in ("/login", "/signup", "/search", "/features", "/marketplace")):
+        return False
+
     blocked_suffixes = (
         ".png",
         ".jpg",
@@ -922,16 +953,35 @@ def should_follow_discovered_link(parent_url: str, child_url: str) -> bool:
     if lowered_path.endswith(blocked_suffixes):
         return False
 
+    if "nvd.nist.gov" in parent_parts.netloc.lower():
+        return any(
+            signal in lowered
+            for signal in (
+                "/vuln/detail/cve-",
+                "/security/advisories/",
+                "/commit/",
+                ".diff",
+                ".patch",
+                "github.com",
+                "gitlab.com",
+            )
+        )
+
     if "lists.fedoraproject.org" in child_parts.netloc.lower():
-        lowered = child_url.lower()
         return "/message/" in lowered or "cve-" in lowered
+
+    if "github.com" in parent_parts.netloc.lower() and "github.com" in child_parts.netloc.lower():
+        parent_repo = [segment for segment in parent_parts.path.split("/") if segment][:2]
+        child_repo = [segment for segment in child_parts.path.split("/") if segment][:2]
+        if len(parent_repo) == 2 and parent_repo == child_repo:
+            return score_reference(child_url) in {"P0", "P1"}
+        return "/security/advisories/" in lowered and score_reference(child_url) in {"P0", "P1"}
 
     if child_parts.netloc == parent_parts.netloc:
         return True
 
-    lowered = child_url.lower()
     if "github.com" in lowered or "gitlab.com" in lowered:
-        return True
+        return score_reference(child_url) in {"P0", "P1"}
     if "advisory" in lowered or "security" in lowered or "cve-" in lowered:
         return True
     if score_reference(child_url) in {"P0", "P1", "P2"}:
@@ -1047,12 +1097,82 @@ def infer_git_refs(
     return vulnerable_ref, fixed_ref
 
 
+def extract_summary_candidate(page: FetchedPage) -> str:
+    text = page.cleaned_text.strip()
+    if not text:
+        return ""
+
+    section_markers = ("Description", "Impact", "Summary", "Details")
+    lines = [line.strip() for line in text.splitlines()]
+    for index, line in enumerate(lines):
+        if line not in section_markers:
+            continue
+        collected: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if not candidate:
+                if collected:
+                    break
+                continue
+            if candidate in section_markers or len(candidate) <= 2:
+                if collected:
+                    break
+                continue
+            collected.append(candidate)
+            if sum(len(item) for item in collected) >= 700:
+                break
+        if collected:
+            return " ".join(collected)[:1000]
+
+    paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
+    for paragraph in paragraphs:
+        lowered = paragraph.lower()
+        if any(noise in lowered for noise in ("navigation menu", "toggle navigation", "search or jump to")):
+            continue
+        if len(paragraph) >= 80:
+            return paragraph[:1000]
+
+    first_paragraph = paragraphs[0] if paragraphs else ""
+    return first_paragraph[:1000] if first_paragraph else ""
+
+
+def page_summary_score(page: FetchedPage) -> int:
+    lowered_url = page.url.lower()
+    lowered_text = page.cleaned_text.lower()
+    score = 0
+
+    if "nvd.nist.gov/vuln/detail/" in lowered_url:
+        score += 50
+    if "/security/advisories/" in lowered_url or "ghsa-" in lowered_url:
+        score += 45
+    if "cveproject" in lowered_url or "cvelist" in lowered_url or "osv.dev" in lowered_url:
+        score += 35
+    if "/commit/" in lowered_url:
+        score -= 20
+    if ".diff" in lowered_url or ".patch" in lowered_url:
+        score -= 10
+    if "description" in lowered_text:
+        score += 20
+    if "impact" in lowered_text:
+        score += 10
+    if "navigation menu" in lowered_text:
+        score -= 15
+
+    candidate = extract_summary_candidate(page)
+    if len(candidate) >= 120:
+        score += 10
+    return score
+
+
 def heuristic_summary_from_pages(fetched_pages: List[FetchedPage]) -> str:
-    for page in fetched_pages:
-        if page.cleaned_text:
-            first_paragraph = page.cleaned_text.split("\n\n", 1)[0].strip()
-            if first_paragraph:
-                return first_paragraph[:1000]
+    ranked_pages = sorted(
+        (page for page in fetched_pages if page.cleaned_text.strip()),
+        key=page_summary_score,
+        reverse=True,
+    )
+    for page in ranked_pages:
+        candidate = extract_summary_candidate(page)
+        if candidate:
+            return candidate
     return ""
 
 
@@ -1065,6 +1185,14 @@ def infer_vulnerability_type(text: str) -> str:
         ("null pointer", "null-pointer-dereference"),
         ("out-of-bounds", "out-of-bounds-access"),
         ("denial of service", "denial-of-service"),
+        ("privilege escalation", "privilege-escalation"),
+        ("authentication bypass", "authentication-bypass"),
+        ("authorization bypass", "authorization-bypass"),
+        ("business logic", "business-logic-error"),
+        ("protocol rule", "business-logic-error"),
+        ("improper validation", "improper-input-validation"),
+        ("validation", "improper-input-validation"),
+        ("not checked", "improper-input-validation"),
     ]
     for needle, label in mapping:
         if needle in lowered:
