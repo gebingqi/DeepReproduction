@@ -26,6 +26,9 @@ class RuntimeConfig(BaseModel):
     workspace_root: str = Field(default="workspaces", description="Workspace root directory.")
     knowledge_max_reference_depth: int = Field(default=3, description="Maximum recursive URL depth for the knowledge stage.")
     knowledge_max_fetch_count: int = Field(default=12, description="Maximum number of fetched references for one knowledge-stage run.")
+    knowledge_max_selected_references: int = Field(default=24, description="Maximum number of selected references retained after prioritization.")
+    knowledge_max_discovered_references_per_page: int = Field(default=8, description="Maximum number of recursively discovered references kept from one page.")
+    knowledge_max_output_references: int = Field(default=30, description="Maximum number of references written to final knowledge output.")
     knowledge_fetch_timeout_seconds: int = Field(default=8, description="Timeout for each remote fetch in the knowledge stage.")
     knowledge_enable_llm_curation: bool = Field(default=False, description="Whether the knowledge stage should invoke the curation LLM.")
     llm_timeout_seconds: int = Field(default=30, description="Timeout passed to LLM client requests.")
@@ -67,6 +70,9 @@ def load_app_config() -> AppConfig:
             workspace_root=os.getenv("WORKSPACE_ROOT", "workspaces"),
             knowledge_max_reference_depth=int(os.getenv("KNOWLEDGE_MAX_REFERENCE_DEPTH", "3")),
             knowledge_max_fetch_count=int(os.getenv("KNOWLEDGE_MAX_FETCH_COUNT", "12")),
+            knowledge_max_selected_references=int(os.getenv("KNOWLEDGE_MAX_SELECTED_REFERENCES", "24")),
+            knowledge_max_discovered_references_per_page=int(os.getenv("KNOWLEDGE_MAX_DISCOVERED_REFERENCES_PER_PAGE", "8")),
+            knowledge_max_output_references=int(os.getenv("KNOWLEDGE_MAX_OUTPUT_REFERENCES", "30")),
             knowledge_fetch_timeout_seconds=int(os.getenv("KNOWLEDGE_FETCH_TIMEOUT_SECONDS", "8")),
             knowledge_enable_llm_curation=os.getenv("KNOWLEDGE_ENABLE_LLM_CURATION", "0").strip().lower() in {"1", "true", "yes", "on"},
             llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
