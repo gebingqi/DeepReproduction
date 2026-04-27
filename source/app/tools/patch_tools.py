@@ -3,9 +3,26 @@
 from __future__ import annotations
 
 import re
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
+
+
+def find_patch_diff(cve_id: str) -> Optional[Path]:
+    """Locate patch.diff with dual-prefix lookup.
+
+    Searches in this order:
+      1. Dataset/<cve_id>/vuln_data/vuln_diffs/patch.diff
+      2. source/Dataset/<cve_id>/vuln_data/vuln_diffs/patch.diff
+
+    Returns None if neither exists.
+    """
+    for prefix in ("Dataset", "source/Dataset"):
+        candidate = Path(prefix) / cve_id / "vuln_data" / "vuln_diffs" / "patch.diff"
+        if candidate.exists():
+            return candidate
+    return None
 
 
 class PatchSummary(BaseModel):

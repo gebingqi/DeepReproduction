@@ -4,10 +4,20 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel
 from app.stages import build as build_module
 from app.tools.process_tools import ProcessResult
+
+
+@pytest.fixture(autouse=True)
+def _restore_find_patch_diff():
+    """Restore the original find_patch_diff after each test so module state doesn't leak."""
+    original = build_module.find_patch_diff
+    yield
+    build_module.find_patch_diff = original
 
 
 def make_knowledge(**overrides):
@@ -103,8 +113,9 @@ def _make_stage_with_mocks(
         container_run_return = default_container_run
     stage.docker_tool.run_container = container_run_return
 
-    if locate_patch_return is not None:
-        stage._locate_patch_diff = lambda cve_id: locate_patch_return
+    # Always patch find_patch_diff at the module level so the build stage sees our value.
+    # Use setattr so the override survives across method calls.
+    build_module.find_patch_diff = lambda cve_id: locate_patch_return
 
     return stage
 
@@ -319,20 +330,21 @@ def test_verify_build_artifact_records_patch_apply_failure(tmp_path):
     assert result["verify_status"] == "partial"
 
 
-def test_locate_patch_diff_dual_prefix(tmp_path, monkeypatch):
-    stage = build_module.BuildStage()
+def test_find_patch_diff_dual_prefix(tmp_path, monkeypatch):
+    from app.tools.patch_tools import find_patch_diff
+
     original_cwd = os.getcwd()
     monkeypatch.chdir(tmp_path)
 
     try:
         # Neither exists
-        assert stage._locate_patch_diff("CVE-FAKE") is None
+        assert find_patch_diff("CVE-FAKE") is None
 
         # Create in Dataset/
         ds_path = tmp_path / "Dataset" / "CVE-FAKE" / "vuln_data" / "vuln_diffs"
         ds_path.mkdir(parents=True)
         (ds_path / "patch.diff").write_text("diff content\n", encoding="utf-8")
-        found = stage._locate_patch_diff("CVE-FAKE")
+        found = find_patch_diff("CVE-FAKE")
         assert found is not None
         assert "Dataset" in str(found)
 
@@ -343,7 +355,7 @@ def test_locate_patch_diff_dual_prefix(tmp_path, monkeypatch):
         src_path = tmp_path / "source" / "Dataset" / "CVE-FAKE" / "vuln_data" / "vuln_diffs"
         src_path.mkdir(parents=True)
         (src_path / "patch.diff").write_text("diff content 2\n", encoding="utf-8")
-        found = stage._locate_patch_diff("CVE-FAKE")
+        found = find_patch_diff("CVE-FAKE")
         assert found is not None
         assert "source/Dataset" in str(found)
     finally:

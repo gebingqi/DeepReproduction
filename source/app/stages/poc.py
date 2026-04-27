@@ -33,6 +33,12 @@ from app.schemas.poc_artifact import PoCArtifact
 from app.stages.build import parse_llm_json_payload
 from app.tools.docker_tools import DockerBuildRequest, DockerRunRequest, DockerTool
 from app.tools.file_tools import FileTool
+from app.tools.log_parsing import (
+    extract_block as _extract_block_module,
+    extract_execution_observation as _extract_execution_observation_module,
+    match_patterns as _match_patterns_module,
+)
+from app.tools.patch_tools import find_patch_diff
 
 
 class PocStagePaths:
@@ -54,6 +60,7 @@ class PocStagePaths:
         self.poc_log = self.poc_dir / "poc.log"
         self.crash_report = self.poc_dir / "crash_report.txt"
         self.poc_artifact_yaml = self.poc_dir / "poc_artifact.yaml"
+        self.run_verify_yaml = self.poc_dir / "run_verify.yaml"
 
 
 class PocContext(BaseModel):
@@ -107,6 +114,65 @@ class PocPlan(BaseModel):
     rationale: str = Field(default="", description="Short rationale.")
     dockerfile_override: Optional[str] = Field(default=None, description="Optional full Dockerfile override.")
     run_script_override: Optional[str] = Field(default=None, description="Optional full run script override.")
+
+
+class RunVerifyReport(BaseModel):
+    """Minimum-eligibility report for one PoC execution.
+
+    本报告回答一个问题：这一次 PoC 执行是否构成进入 verify agent 的资格。
+    它不裁决漏洞是否被复现，只裁决 PoC 这一次"打到目标行为"的可信度。
+    """
+
+    script_finished: bool = Field(
+        default=False,
+        description="run.sh 是否完整跑完。从日志中观察到 execution_exit_code= 行即为 True。",
+    )
+    log_well_formed: bool = Field(
+        default=False,
+        description="日志契约是否完整：stdout_begin/end 与 stderr_begin/end 两对标记块是否都出现。",
+    )
+    target_binary_invoked: bool = Field(
+        default=False,
+        description="日志中是否出现 target_binary= 行，用于确认 run.sh 跑到了目标二进制调用前。",
+    )
+    exit_code_observed: Optional[int] = Field(
+        default=None,
+        description="观测到的 execution_exit_code 值；未观测到时为 None。",
+    )
+    error_pattern_hits: list[str] = Field(
+        default_factory=list,
+        description="实际命中的 expected_stderr_patterns 列表。",
+    )
+    stack_keyword_hits: list[str] = Field(
+        default_factory=list,
+        description="实际命中的 expected_stack_keywords 列表。",
+    )
+    crash_type_hit: str = Field(
+        default="",
+        description="日志里识别出的崩溃类型字符串；未识别为空字符串。",
+    )
+    crash_type_compatible: Optional[bool] = Field(
+        default=None,
+        description="crash_type_hit 是否与 plan.expected_crash_type 兼容（包含或被包含，大小写不敏感）。"
+                    "expected_crash_type 为空时为 None。",
+    )
+    exit_code_match_expected: Optional[bool] = Field(
+        default=None,
+        description="exit_code_observed 是否等于 plan.expected_exit_code；"
+                    "plan.expected_exit_code 为 None 时本字段为 None。",
+    )
+    eligible_for_verify: bool = Field(
+        default=False,
+        description="综合判定结果：这一次 PoC 是否构成进入 verify 的资格。",
+    )
+    eligibility_reason: str = Field(
+        default="",
+        description="eligible_for_verify 取值的简短原因，便于人工诊断。",
+    )
+    evidence_log_excerpt: str = Field(
+        default="",
+        description="关键日志摘录，最多 2048 字节。",
+    )
 
 
 class PocStage:
@@ -483,12 +549,19 @@ class PocStage:
         )
 
         execution_success = docker_build_result.success and bool(run_result.success)
-        reproducer_verified = self._is_reproducer_verified(
-            observation=observation,
+        run_verify_report = self._build_run_verify_report(
             plan=plan,
+            observation=observation,
+            execution_logs=execution_logs,
             matched_error_patterns=matched_error_patterns,
             matched_stack_keywords=matched_stack_keywords,
         )
+        self.file_tool.safe_persist(
+            str(paths.run_verify_yaml),
+            yaml.safe_dump(run_verify_report.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
+            description="run_verify.yaml",
+        )
+        reproducer_verified = run_verify_report.eligible_for_verify
         return PoCArtifact(
             root_cause_analysis="",
             payload_generation_strategy=plan.rationale,
@@ -574,11 +647,10 @@ class PocStage:
         return artifact
 
     def _read_patch_diff(self, cve_id: str) -> str:
-        for prefix in ("Dataset", "source/Dataset"):
-            path = Path(prefix) / cve_id / "vuln_data" / "vuln_diffs" / "patch.diff"
-            if path.exists():
-                return path.read_text(encoding="utf-8", errors="replace")
-        return ""
+        path = find_patch_diff(cve_id)
+        if path is None:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
 
     def _discover_candidate_binaries(self, repo_dir: Path) -> list[str]:
         candidates: list[str] = []
@@ -854,53 +926,113 @@ class PocStage:
         return "\n".join(parts).strip() + "\n"
 
     def _extract_execution_observation(self, execution_logs: str) -> dict[str, Any]:
-        stdout = self._extract_block(execution_logs, "stdout_begin", "stdout_end")
-        stderr = self._extract_block(execution_logs, "stderr_begin", "stderr_end")
-        exit_code = None
-        match = re.search(r"execution_exit_code=(\d+)", execution_logs)
-        if match:
-            exit_code = int(match.group(1))
-        crash_type = ""
-        joined = f"{stdout}\n{stderr}".lower()
-        for marker in ("segmentation fault", "assert", "abort", "heap-buffer-overflow", "stack-overflow"):
-            if marker in joined:
-                crash_type = marker
-                break
-        return {
-            "observed_exit_code": exit_code,
-            "observed_stdout": stdout,
-            "observed_stderr": stderr,
-            "observed_crash_type": crash_type,
-        }
+        return _extract_execution_observation_module(execution_logs)
 
     def _extract_block(self, text: str, begin: str, end: str) -> str:
-        pattern = rf"{re.escape(begin)}\n(.*?)(?:\n{re.escape(end)})"
-        match = re.search(pattern, text, re.DOTALL)
-        if not match:
-            return ""
-        return match.group(1).strip()
+        return _extract_block_module(text, begin, end)
 
     def _match_patterns(self, haystack: str, patterns: list[str]) -> list[str]:
-        lowered = haystack.lower()
-        matches = [pattern for pattern in patterns if pattern and pattern.lower() in lowered]
-        return sorted(set(matches))
+        return _match_patterns_module(haystack, patterns)
 
-    def _is_reproducer_verified(
+    def _build_run_verify_report(
         self,
-        observation: dict[str, Any],
         plan: PocPlan,
+        observation: dict[str, Any],
+        execution_logs: str,
         matched_error_patterns: list[str],
         matched_stack_keywords: list[str],
-    ) -> bool:
-        if matched_error_patterns or matched_stack_keywords:
-            return True
-        if observation["observed_crash_type"] and (
-            not plan.expected_crash_type or observation["observed_crash_type"] == plan.expected_crash_type.lower()
-        ):
-            return True
-        if plan.expected_exit_code is not None and observation["observed_exit_code"] == plan.expected_exit_code:
-            return True
-        return False
+    ) -> RunVerifyReport:
+        """Compute the minimum-eligibility report for one PoC execution."""
+
+        # 3.1 script_finished
+        script_finished = "execution_exit_code=" in execution_logs
+
+        # 3.2 log_well_formed
+        required_markers = ("stdout_begin", "stdout_end", "stderr_begin", "stderr_end")
+        log_well_formed = all(marker in execution_logs for marker in required_markers)
+
+        # 3.3 target_binary_invoked
+        target_binary_invoked = "target_binary=" in execution_logs
+
+        # 3.4 exit_code_observed
+        exit_code_observed = observation.get("observed_exit_code")
+
+        # 3.5 hits
+        error_pattern_hits = list(matched_error_patterns)
+        stack_keyword_hits = list(matched_stack_keywords)
+
+        # 3.6 crash_type_hit
+        crash_type_hit = observation.get("observed_crash_type") or ""
+
+        # 3.7 crash_type_compatible
+        expected_crash = (plan.expected_crash_type or "").strip().lower()
+        observed_crash_lower = crash_type_hit.strip().lower()
+        if not expected_crash:
+            crash_type_compatible: Optional[bool] = None
+        elif not observed_crash_lower:
+            crash_type_compatible = False
+        else:
+            crash_type_compatible = (expected_crash in observed_crash_lower) or (observed_crash_lower in expected_crash)
+
+        # 3.8 exit_code_match_expected
+        if plan.expected_exit_code is None:
+            exit_code_match_expected: Optional[bool] = None
+        elif exit_code_observed is None:
+            exit_code_match_expected = False
+        else:
+            exit_code_match_expected = (exit_code_observed == plan.expected_exit_code)
+
+        # 3.9 eligible_for_verify
+        eligible_for_verify = False
+        eligibility_reason = ""
+        if not script_finished:
+            eligibility_reason = "script_did_not_finish: missing execution_exit_code marker"
+        elif not log_well_formed:
+            eligibility_reason = "log_not_well_formed: stdout/stderr block markers missing"
+        else:
+            if error_pattern_hits:
+                eligible_for_verify = True
+                eligibility_reason = f"error_pattern_hit: {error_pattern_hits[0]}"
+            elif stack_keyword_hits:
+                eligible_for_verify = True
+                eligibility_reason = f"stack_keyword_hit: {stack_keyword_hits[0]}"
+            elif crash_type_compatible is True:
+                eligible_for_verify = True
+                eligibility_reason = f"crash_type_compatible: observed={crash_type_hit}"
+            elif exit_code_match_expected is True:
+                eligible_for_verify = True
+                eligibility_reason = f"exit_code_match: {exit_code_observed}"
+            else:
+                eligible_for_verify = False
+                eligibility_reason = "no_target_behavior_observed"
+
+        # 3.10 evidence_log_excerpt
+        MAX_EXCERPT_BYTES = 2048
+        stderr_block = self._extract_block(execution_logs, "stderr_begin", "stderr_end")
+        if stderr_block:
+            excerpt = stderr_block
+        else:
+            excerpt = execution_logs
+        excerpt_bytes = excerpt.encode("utf-8", errors="replace")
+        if len(excerpt_bytes) > MAX_EXCERPT_BYTES:
+            excerpt_bytes = excerpt_bytes[-MAX_EXCERPT_BYTES:]
+            excerpt = excerpt_bytes.decode("utf-8", errors="replace")
+        evidence_log_excerpt = excerpt
+
+        return RunVerifyReport(
+            script_finished=script_finished,
+            log_well_formed=log_well_formed,
+            target_binary_invoked=target_binary_invoked,
+            exit_code_observed=exit_code_observed,
+            error_pattern_hits=error_pattern_hits,
+            stack_keyword_hits=stack_keyword_hits,
+            crash_type_hit=crash_type_hit,
+            crash_type_compatible=crash_type_compatible,
+            exit_code_match_expected=exit_code_match_expected,
+            eligible_for_verify=eligible_for_verify,
+            eligibility_reason=eligibility_reason,
+            evidence_log_excerpt=evidence_log_excerpt,
+        )
 
     def _classify_failure_kind(self, execution_logs: str) -> str:
         if "image_build_success=False" in execution_logs:

@@ -61,6 +61,7 @@ def build_app_graph():
         {
             "success": END,
             "failed": END,
+            "inconclusive": END,
         },
     )
 

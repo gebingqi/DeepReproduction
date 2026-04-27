@@ -48,9 +48,21 @@ def route_after_poc(state):
 
 
 def route_after_verify(state):
-    """验证阶段后的路由规则。"""
+    """验证阶段后的路由规则。
+
+    返回值语义：
+    - `success`：复现闭环（pre 触发 + post 不触发）
+    - `failed`：复现失败（pre 未触发 或 post 仍触发）
+    - `inconclusive`：无法判定（patch 打不上 / log 不完整 / 阶段异常）
+
+    当前三个出口都接到 END。`inconclusive` 出口保留给未来人工复核或重试。
+    """
 
     verify = state.get("verify")
-    if verify and verify.verdict == "success":
+    if verify is None:
+        return "failed"
+    if verify.verdict == "success":
         return "success"
+    if verify.verdict == "inconclusive":
+        return "inconclusive"
     return "failed"

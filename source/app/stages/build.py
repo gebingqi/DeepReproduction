@@ -30,6 +30,7 @@ from app.schemas.knowledge import KnowledgeModel
 from app.tools.docker_tools import DockerBuildRequest, DockerRunRequest, DockerTool
 from app.tools.file_tools import FileTool
 from app.tools.git_tools import GitTool
+from app.tools.patch_tools import find_patch_diff
 from app.tools.process_tools import ProcessRequest, ProcessTool
 
 
@@ -255,7 +256,7 @@ class BuildStage:
     def collect_build_context(self, knowledge: KnowledgeModel, repo_path: Path, planner_attempt: int = 1) -> BuildContext:
         """Collect local build evidence from repo snapshots, patch diff, and knowledge outputs."""
 
-        patch_diff_path = self._locate_patch_diff(knowledge.cve_id)
+        patch_diff_path = find_patch_diff(knowledge.cve_id)
         patch_diff_text = ""
         if patch_diff_path is not None:
             patch_diff_text = patch_diff_path.read_text(encoding="utf-8", errors="replace")
@@ -927,14 +928,6 @@ class BuildStage:
     def _sanitizer_enabled(self, build_script_content: str) -> bool:
         return "-fsanitize=" in build_script_content
 
-    def _locate_patch_diff(self, cve_id: str) -> Optional[Path]:
-        """Locate patch.diff with PoC-style dual-prefix lookup."""
-        for prefix in ("Dataset", "source/Dataset"):
-            candidate = Path(prefix) / cve_id / "vuln_data" / "vuln_diffs" / "patch.diff"
-            if candidate.exists():
-                return candidate
-        return None
-
     def _verify_build_artifact(
         self,
         artifact: BuildArtifact,
@@ -1066,7 +1059,7 @@ class BuildStage:
 
         # 4.9 patch_appliable_in_container
         try:
-            patch_diff_path = self._locate_patch_diff(cve_id)
+            patch_diff_path = find_patch_diff(cve_id)
             if patch_diff_path is None:
                 result["patch_appliable_in_container"] = {
                     "checked": False,

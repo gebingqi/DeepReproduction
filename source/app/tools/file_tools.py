@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -48,3 +49,19 @@ class FileTool:
         """判断路径是否存在。"""
 
         return Path(path).exists()
+
+    def safe_persist(self, path: str, content: str, description: str = "") -> bool:
+        """Best-effort persist. Returns True on success, False on failure (with stderr warning).
+
+        与 write_text 不同的是：失败时不抛异常，而是打 stderr 警告并返回 False。
+        用于"非致命落盘"场景——即便落盘失败也不应让主流程崩溃。
+        """
+
+        try:
+            self.write_text(path, content)
+            return True
+        except Exception as error:
+            sys.stderr.write(
+                f"[WARN] failed to persist {description or path}: {error}\n"
+            )
+            return False
