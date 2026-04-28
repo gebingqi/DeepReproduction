@@ -307,3 +307,217 @@ def test_poc_artifact_persists_plan_fields_for_verify(tmp_path):
     assert artifact.environment_variables == {"ASAN_OPTIONS": "detect_leaks=0"}
     assert artifact.expected_stack_keywords == ["singlevar"]
     assert artifact.expected_crash_type == "heap-buffer-overflow"
+
+
+# ===== Fix 1.B: stdout/stderr matching is stream-aware =====
+def test_match_patterns_separates_stdout_and_stderr(tmp_path):
+    """模式放在错误的流里时不应被命中——证明 stream-aware matching 真在工作。"""
+
+    class FakeDockerTool:
+        def build_image(self, request):
+            class Result:
+                success = True
+                exit_code = 0
+                stdout = "built"
+                stderr = ""
+
+            return Result()
+
+        def run_container(self, request):
+            class Result:
+                success = True
+                exit_code = 0
+                stdout = (
+                    "target_binary=demo\ntrigger_command=demo poc\n"
+                    "execution_exit_code=0\n"
+                    "stdout_begin\n"
+                    "some output with needle_err but not the other\n"
+                    "stdout_end\n"
+                    "stderr_begin\n"
+                    "error log with needle_out but not the other\n"
+                    "stderr_end\n"
+                )
+                stderr = ""
+
+            return Result()
+
+    stage = poc_module.PocStage(docker_tool=FakeDockerTool())
+    paths = poc_module.PocStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    paths.repo_dir.mkdir(parents=True, exist_ok=True)
+
+    plan = poc_module.PocPlan(
+        target_binary="demo",
+        payload_filename="poc.txt",
+        payload_content="boom\n",
+        run_command="demo /workspace/artifacts/poc/payloads/poc.txt",
+        expected_stdout_patterns=["needle_out"],   # 实际出现在 stderr
+        expected_stderr_patterns=["needle_err"],   # 实际出现在 stdout
+    )
+
+    artifact = stage._execute_poc_plan(
+        paths=paths,
+        plan_meta={"docker_image_tag": "demo:poc", "base_image_tag": "demo:build"},
+        plan=plan,
+    )
+
+    # 关键：流分离正确，错误流的模式不会跨流命中
+    assert artifact.matched_stdout_patterns == []
+    assert artifact.matched_stderr_patterns == []
+    assert artifact.matched_error_patterns == []  # 与 stderr 同步
+
+
+# ===== Fix 2.A: replan continues when executed_but_not_verified =====
+def test_replan_continues_when_executed_but_not_verified(tmp_path, monkeypatch):
+    """第一次跑 reproducer_verified=False，replan 应被触发；第二次成功后停止。"""
+
+    stage = poc_module.PocStage()
+
+    # Mock context-collection / planning / persistence to focus on the replan loop
+    fake_context = poc_module.PocContext(cve_id="CVE-2022-0000")
+    fake_plan = poc_module.PocPlan(target_binary="demo", payload_filename="poc.txt")
+
+    monkeypatch.setattr(stage, "collect_poc_context", lambda **kw: fake_context)
+    monkeypatch.setattr(stage, "plan_poc", lambda **kw: fake_plan)
+    monkeypatch.setattr(stage, "_prepare_workspace", lambda paths: None)
+    monkeypatch.setattr(stage.file_tool, "write_text", lambda path, content: None)
+
+    call_count = {"execute": 0, "replan": 0}
+
+    def fake_execute(paths, plan_meta, plan):
+        call_count["execute"] += 1
+        if call_count["execute"] == 1:
+            return PoCArtifact(
+                poc_filename="poc.txt", poc_content="x", run_script_content="y",
+                execution_success=True, reproducer_verified=False, execution_logs="...",
+            )
+        return PoCArtifact(
+            poc_filename="poc.txt", poc_content="x", run_script_content="y",
+            execution_success=True, reproducer_verified=True, execution_logs="...",
+        )
+
+    def fake_replan(**kwargs):
+        call_count["replan"] += 1
+        return fake_plan
+
+    monkeypatch.setattr(stage, "_execute_poc_plan", fake_execute)
+    monkeypatch.setattr(stage, "replan_after_failure", fake_replan)
+
+    knowledge = make_knowledge()
+    build = make_build()
+
+    artifact = stage.run(knowledge=knowledge, build=build, workspace=str(tmp_path / "ws"))
+
+    assert artifact.reproducer_verified is True
+    assert call_count["replan"] >= 1
+
+
+def test_replan_stops_when_max_attempts_reached(tmp_path, monkeypatch):
+    """execution_success=True 但 reproducer_verified=False 时，replan 不会无限循环。"""
+
+    stage = poc_module.PocStage()
+    monkeypatch.setattr(poc_module.PocStage, "MAX_REPLAN_ATTEMPTS", 2)
+
+    fake_context = poc_module.PocContext(cve_id="CVE-2022-0000")
+    fake_plan = poc_module.PocPlan(target_binary="demo", payload_filename="poc.txt")
+
+    monkeypatch.setattr(stage, "collect_poc_context", lambda **kw: fake_context)
+    monkeypatch.setattr(stage, "plan_poc", lambda **kw: fake_plan)
+    monkeypatch.setattr(stage, "_prepare_workspace", lambda paths: None)
+    monkeypatch.setattr(stage.file_tool, "write_text", lambda path, content: None)
+    monkeypatch.setattr(stage, "replan_after_failure", lambda **kw: fake_plan)
+
+    execute_count = {"n": 0}
+
+    def fake_execute(paths, plan_meta, plan):
+        execute_count["n"] += 1
+        return PoCArtifact(
+            poc_filename="poc.txt", poc_content="x", run_script_content="y",
+            execution_success=True, reproducer_verified=False, execution_logs="...",
+        )
+
+    monkeypatch.setattr(stage, "_execute_poc_plan", fake_execute)
+
+    stage.run(knowledge=make_knowledge(), build=make_build(), workspace=str(tmp_path / "ws"))
+
+    # 终止性断言：MAX_REPLAN_ATTEMPTS=2 时最多 2*2=4 次执行（每 attempt 最多 1 initial + 1 replan）
+    assert 0 < execute_count["n"] <= 4
+    # 最关键的：跑完了——没有无限循环
+
+
+# ===== Fix 2.C: poc_node history reflects three-way state =====
+def test_poc_node_history_executed_but_unverified(monkeypatch):
+    artifact = PoCArtifact(
+        poc_filename="poc.txt", poc_content="x", run_script_content="y",
+        execution_success=True,
+        reproducer_verified=False,
+        execution_logs="ran but no signal",
+    )
+
+    class FakeStage:
+        def run(self, knowledge, build, workspace):
+            return artifact
+
+    monkeypatch.setattr(poc_module, "PocStage", FakeStage)
+
+    state = {
+        "knowledge": make_knowledge(),
+        "build": make_build(),
+        "workspace": "workspaces/CVE-2022-28805",
+        "retry_count": {},
+        "stage_history": [],
+    }
+
+    result = poc_module.poc_node(state)
+
+    assert result["current_stage"] == "verify"
+    assert result["stage_history"][-1]["stage"] == "poc"
+    assert result["stage_history"][-1]["status"] == "executed_but_unverified"
+    assert "deferring to verify" in result["stage_history"][-1]["note"]
+
+
+def test_poc_node_history_full_success(monkeypatch):
+    """回归：execution_success=True && reproducer_verified=True → status=success."""
+
+    artifact = PoCArtifact(
+        poc_filename="poc.txt", poc_content="x", run_script_content="y",
+        execution_success=True,
+        reproducer_verified=True,
+        execution_logs="...",
+    )
+
+    class FakeStage:
+        def run(self, knowledge, build, workspace):
+            return artifact
+
+    monkeypatch.setattr(poc_module, "PocStage", FakeStage)
+
+    state = {
+        "knowledge": make_knowledge(),
+        "build": make_build(),
+        "workspace": "workspaces/CVE-2022-28805",
+        "retry_count": {},
+        "stage_history": [],
+    }
+
+    result = poc_module.poc_node(state)
+
+    assert result["current_stage"] == "verify"
+    assert result["stage_history"][-1]["status"] == "success"
+
+
+# ===== Fix 2.E: route_after_poc still advances on executed_but_unverified =====
+def test_route_after_poc_advances_when_executed_but_unverified():
+    """H5 设计文档：execution_success=True 即推进 verify，无视 reproducer_verified。"""
+
+    from app.orchestrator.routers import route_after_poc
+
+    state = {
+        "poc": PoCArtifact(
+            poc_filename="x", poc_content="", run_script_content="",
+            execution_success=True,
+            reproducer_verified=False,  # 关键：未触发
+        ),
+        "retry_count": {},
+    }
+    assert route_after_poc(state) == "verify"

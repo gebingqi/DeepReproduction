@@ -157,52 +157,133 @@ def test_decide_verdict_inconclusive_when_log_not_well_formed():
     assert result.reason.startswith("log_not_well_formed")
 
 
-# ===== Case 6 =====
-def test_short_circuit_when_run_verify_ineligible(tmp_path):
+# ===== Case 6: short-circuit shared harness + 5 split tests =====
+def _setup_short_circuit_workspace(tmp_path, eligibility_reason: str, eligible: bool = False, with_patch: bool = True):
+    """Helper: build a workspace + run_verify.yaml + (optional) patch.diff for short-circuit tests.
+
+    Returns (workspace, knowledge, build, poc, fake_docker).
+    """
+
     workspace = tmp_path / "ws"
     paths = verify_module.VerifyStagePaths(str(workspace))
     paths.poc_dir.mkdir(parents=True, exist_ok=True)
-    paths.run_verify_yaml.write_text(
-        yaml.safe_dump(
-            {"eligible_for_verify": False, "eligibility_reason": "no_target_behavior_observed"}
-        ),
-        encoding="utf-8",
-    )
+    payload = {"eligible_for_verify": eligible}
+    if eligibility_reason is not None:
+        payload["eligibility_reason"] = eligibility_reason
+    paths.run_verify_yaml.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    if with_patch:
+        # Place a patch.diff under the default Dataset/ root in the cwd so find_patch_diff finds it.
+        patch_target = tmp_path / "Dataset" / "CVE-2022-0000" / "vuln_data" / "vuln_diffs" / "patch.diff"
+        patch_target.parent.mkdir(parents=True, exist_ok=True)
+        patch_target.write_text("--- a\n+++ b\n", encoding="utf-8")
 
     knowledge = KnowledgeModel(
         cve_id="CVE-2022-0000",
         summary="demo",
         vulnerability_type="heap-overflow",
-        repo_url="https://example.com/demo.git",
-        vulnerable_ref="abc1234",
     )
     build = BuildArtifact(
-        dockerfile_content="FROM ubuntu\n",
-        build_script_content="#!/bin/bash\n",
+        dockerfile_content="x",
+        build_script_content="y",
         build_success=True,
         docker_image_tag="demo:build",
-        chosen_vulnerable_ref="abc1234",
-        chosen_fixed_ref="fff5678",
     )
     poc = PoCArtifact(
         poc_filename="poc.lua",
         poc_content="boom",
         run_script_content="#!/bin/bash\n",
-        target_binary="src/lua",
-        trigger_command="src/lua poc.lua",
-        execution_success=True,
     )
-
     fake_docker = MagicMock()
     fake_docker.run_container = MagicMock()
-    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+    return workspace, knowledge, build, poc, fake_docker
 
+
+def test_short_circuit_script_did_not_finish_to_inconclusive(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+        tmp_path, eligibility_reason="script_did_not_finish: missing execution_exit_code marker"
+    )
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
     result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
 
     assert result.verdict == "inconclusive"
-    assert result.reason.startswith("short_circuit:poc_run_verify_ineligible")
+    assert result.reason == "short_circuit:script_did_not_finish"
     assert fake_docker.run_container.call_count == 0
-    assert paths.verify_result_yaml.exists()
+
+
+def test_short_circuit_no_target_behavior_to_failed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+        tmp_path, eligibility_reason="no_target_behavior_observed"
+    )
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+    result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
+
+    assert result.verdict == "failed"
+    assert result.reason == "short_circuit:pre_not_triggered"
+    assert fake_docker.run_container.call_count == 0
+
+
+def test_short_circuit_log_not_well_formed_to_inconclusive(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+        tmp_path, eligibility_reason="log_not_well_formed: stdout/stderr block markers missing"
+    )
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+    result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
+
+    assert result.verdict == "inconclusive"
+    assert result.reason == "short_circuit:log_not_well_formed"
+
+
+def test_short_circuit_unknown_reason_falls_back_to_inconclusive(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+        tmp_path, eligibility_reason="some_future_reason_we_dont_know"
+    )
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+    result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
+
+    assert result.verdict == "inconclusive"
+    assert "unknown_eligibility_reason" in result.reason
+
+
+def test_short_circuit_patch_diff_not_found_unchanged(tmp_path, monkeypatch):
+    """patch.diff 缺失时短路保持 inconclusive，不依赖 run_verify。"""
+
+    monkeypatch.chdir(tmp_path)
+    workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+        tmp_path, eligibility_reason="error_pattern_hit: foo", eligible=True, with_patch=False,
+    )
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+    result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
+
+    assert result.verdict == "inconclusive"
+    assert result.reason == "short_circuit:patch_diff_not_found"
+
+
+def test_short_circuit_pre_patch_triggered_always_false(tmp_path, monkeypatch):
+    """短路时 verify 没真跑 pre，pre_patch_triggered 必须始终 False，无论 verdict。"""
+
+    cases = [
+        "script_did_not_finish: ...",
+        "no_target_behavior_observed",
+        "log_not_well_formed: ...",
+        "some_unknown_reason",
+    ]
+    for fixture_reason in cases:
+        # Each case needs a fresh workspace so cwd-relative patch.diff lookup is clean.
+        monkeypatch.chdir(tmp_path)
+        sub = tmp_path / fixture_reason.split(":")[0].replace(" ", "_")
+        sub.mkdir(exist_ok=True)
+        monkeypatch.chdir(sub)
+        workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+            sub, eligibility_reason=fixture_reason
+        )
+        stage = verify_module.VerifyStage(docker_tool=fake_docker)
+        result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
+        assert result.pre_patch_triggered is False, f"failed for: {fixture_reason}"
 
 
 # ===== Case 7 =====
@@ -602,34 +683,18 @@ def test_extract_patch_apply_log_falls_back_to_legacy_radius():
 
 
 # ===== Fix 7: short_circuit prefix vs real-run no-prefix =====
-def test_short_circuit_reason_carries_prefix(tmp_path):
-    workspace = tmp_path / "ws"
-    paths = verify_module.VerifyStagePaths(str(workspace))
-    paths.poc_dir.mkdir(parents=True, exist_ok=True)
-    paths.run_verify_yaml.write_text(
-        yaml.safe_dump(
-            {"eligible_for_verify": False, "eligibility_reason": "no_target_behavior_observed"}
-        ),
-        encoding="utf-8",
-    )
+def test_short_circuit_reason_carries_prefix(tmp_path, monkeypatch):
+    """Sanity check: short-circuit reasons always carry the short_circuit: prefix.
 
-    knowledge = KnowledgeModel(
-        cve_id="CVE-2022-0000",
-        summary="demo",
-        vulnerability_type="heap-overflow",
+    We use the script_did_not_finish fixture (still maps to inconclusive) so this stays
+    independent of the verdict-routing tests above.
+    """
+
+    monkeypatch.chdir(tmp_path)
+    workspace, knowledge, build, poc, fake_docker = _setup_short_circuit_workspace(
+        tmp_path, eligibility_reason="script_did_not_finish: missing execution_exit_code marker"
     )
-    build = BuildArtifact(
-        dockerfile_content="x",
-        build_script_content="y",
-        build_success=True,
-        docker_image_tag="demo:build",
-    )
-    poc = PoCArtifact(
-        poc_filename="poc.lua",
-        poc_content="boom",
-        run_script_content="#!/bin/bash\n",
-    )
-    stage = verify_module.VerifyStage()
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
     result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
 
     assert result.reason.startswith("short_circuit:")
@@ -645,3 +710,18 @@ def test_real_run_failed_reason_has_no_prefix():
     assert result.verdict == "failed"
     assert result.reason == "pre_not_triggered"
     assert not result.reason.startswith("short_circuit:")
+
+
+# ===== Fix 1.C: _is_triggered recognizes stdout-only match =====
+def test_is_triggered_recognizes_stdout_match():
+    stage = verify_module.VerifyStage()
+    pass_result = {
+        "matched_stdout_patterns": ["assertion failed"],
+        "matched_stderr_patterns": [],
+        "matched_error_patterns": [],
+        "matched_stack_keywords": [],
+        "crash_type": "",
+        "exit_code": 0,
+    }
+    context = make_context()
+    assert stage._is_triggered(pass_result, context) is True

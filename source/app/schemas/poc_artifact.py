@@ -44,7 +44,15 @@ class PoCArtifact(BaseModel):
     observed_stdout: str = Field(default="", description="观测到的标准输出")
     observed_stderr: str = Field(default="", description="观测到的标准错误")
     observed_crash_type: str = Field(default="", description="观测到的崩溃类型")
-    matched_error_patterns: List[str] = Field(default_factory=list, description="实际命中的错误模式")
+    matched_error_patterns: List[str] = Field(default_factory=list, description="实际命中的错误模式（向后兼容字段，等价于 matched_stderr_patterns）")
+    matched_stdout_patterns: List[str] = Field(
+        default_factory=list,
+        description="实际命中的 stdout 模式",
+    )
+    matched_stderr_patterns: List[str] = Field(
+        default_factory=list,
+        description="实际命中的 stderr 模式（与 matched_error_patterns 同步，命名清晰版）",
+    )
     matched_stack_keywords: List[str] = Field(default_factory=list, description="实际命中的栈关键词")
     reproducer_verified: bool = Field(default=False, description="是否已至少一次命中目标行为")
     execution_success: bool = Field(default=False, description="PoC 执行是否成功")

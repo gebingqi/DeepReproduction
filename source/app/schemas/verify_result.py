@@ -31,10 +31,26 @@ class VerifyResult(BaseModel):
     post_patch_observed_crash_type: str = Field(default="", description="post 模式下识别出的崩溃类型")
     pre_patch_log_path: str = Field(default="", description="pre 模式完整日志的相对路径")
     post_patch_log_path: str = Field(default="", description="post 模式完整日志的相对路径")
-    pre_patch_matched_error_patterns: List[str] = Field(default_factory=list, description="pre 模式命中的错误模式")
+    pre_patch_matched_error_patterns: List[str] = Field(default_factory=list, description="pre 模式命中的错误模式（向后兼容，等价于 pre_patch_matched_stderr_patterns）")
     pre_patch_matched_stack_keywords: List[str] = Field(default_factory=list, description="pre 模式命中的栈关键词")
-    post_patch_matched_error_patterns: List[str] = Field(default_factory=list, description="post 模式命中的错误模式")
+    post_patch_matched_error_patterns: List[str] = Field(default_factory=list, description="post 模式命中的错误模式（向后兼容，等价于 post_patch_matched_stderr_patterns）")
     post_patch_matched_stack_keywords: List[str] = Field(default_factory=list, description="post 模式命中的栈关键词")
+    pre_patch_matched_stdout_patterns: List[str] = Field(
+        default_factory=list,
+        description="pre 模式下命中的 stdout 模式",
+    )
+    pre_patch_matched_stderr_patterns: List[str] = Field(
+        default_factory=list,
+        description="pre 模式下命中的 stderr 模式（与 matched_error_patterns 同步）",
+    )
+    post_patch_matched_stdout_patterns: List[str] = Field(
+        default_factory=list,
+        description="post 模式下命中的 stdout 模式",
+    )
+    post_patch_matched_stderr_patterns: List[str] = Field(
+        default_factory=list,
+        description="post 模式下命中的 stderr 模式",
+    )
 
     # ===== patch 应用情况 =====
     patch_apply_log: str = Field(default="", description="post 模式 git apply 输出摘录")

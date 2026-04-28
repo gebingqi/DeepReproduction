@@ -221,3 +221,42 @@ def test_run_verify_crash_type_partial_match_eligible():
     assert report.crash_type_compatible is True
     assert report.eligible_for_verify is True
     assert report.eligibility_reason.startswith("crash_type_compatible")
+
+
+# ===== Fix 1.A: stdout pattern hit produces eligible_for_verify =====
+def test_run_verify_stdout_pattern_hit_eligible():
+    """脚本在 stdout 输出错误信息（stderr 干净），expected_stdout_patterns 命中应判 eligible。"""
+
+    stage = poc_module.PocStage()
+    plan = poc_module.PocPlan(
+        target_binary="demo",
+        payload_filename="poc.txt",
+        run_command="demo poc",
+        expected_stdout_patterns=["stack overflow"],
+        expected_stderr_patterns=[],
+    )
+    logs = make_well_formed_logs(
+        exit_code=1,
+        stdout="Error: stack overflow at line 42",
+        stderr="",
+    )
+    observation = make_observation(
+        exit_code=1,
+        stdout="Error: stack overflow at line 42",
+        stderr="",
+        crash_type="",
+    )
+
+    report = stage._build_run_verify_report(
+        plan=plan,
+        observation=observation,
+        execution_logs=logs,
+        matched_error_patterns=[],
+        matched_stack_keywords=[],
+        matched_stdout_patterns=["stack overflow"],
+    )
+
+    assert report.stdout_pattern_hits == ["stack overflow"]
+    assert report.error_pattern_hits == []
+    assert report.eligible_for_verify is True
+    assert report.eligibility_reason.startswith("stdout_pattern_hit")

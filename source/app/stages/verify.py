@@ -446,9 +446,14 @@ class VerifyStage:
         )
 
         observation = extract_execution_observation(docker_result.stdout)
-        haystack = observation["observed_stdout"] + "\n" + observation["observed_stderr"]
-        matched_error = match_patterns(haystack, plan.expected_stderr_patterns)
-        matched_stack = match_patterns(haystack, plan.expected_stack_keywords)
+        # Stream-aware matching: stdout patterns only in stdout, stderr patterns only in stderr.
+        # Stack keywords still searched in the merged text (stack frames may land on either stream).
+        matched_stdout_patterns = match_patterns(observation["observed_stdout"], plan.expected_stdout_patterns)
+        matched_stderr_patterns = match_patterns(observation["observed_stderr"], plan.expected_stderr_patterns)
+        matched_stack = match_patterns(
+            observation["observed_stdout"] + "\n" + observation["observed_stderr"],
+            plan.expected_stack_keywords,
+        )
 
         required_markers = ("stdout_begin", "stdout_end", "stderr_begin", "stderr_end")
         log_well_formed = all(marker in docker_result.stdout for marker in required_markers)
@@ -464,7 +469,9 @@ class VerifyStage:
             "stdout": observation["observed_stdout"],
             "stderr": observation["observed_stderr"],
             "crash_type": observation["observed_crash_type"],
-            "matched_error_patterns": matched_error,
+            "matched_error_patterns": list(matched_stderr_patterns),  # 向后兼容别名
+            "matched_stdout_patterns": matched_stdout_patterns,
+            "matched_stderr_patterns": matched_stderr_patterns,
             "matched_stack_keywords": matched_stack,
             "patch_apply_exit_code": patch_apply_exit_code,
             "build_rebuild_exit_code": build_rebuild_exit_code,
@@ -503,39 +510,97 @@ class VerifyStage:
         context: VerifyContext,
         paths: VerifyStagePaths,
     ) -> Optional[VerifyResult]:
-        if not context.poc_run_verify_eligible:
-            return VerifyResult(
-                pre_patch_triggered=False,
-                post_patch_clean=False,
-                verdict="inconclusive",
-                reason=f"short_circuit:poc_run_verify_ineligible: {context.poc_run_verify_reason}",
-                confidence="low",
-                evidence_summary="Skipped pre/post execution because PoC run_verify reported ineligible.",
-            )
+        # 基础前提缺失：始终 inconclusive（与 run_verify 无关）
         if not context.patch_diff_path:
-            return VerifyResult(
-                pre_patch_triggered=False,
-                post_patch_clean=False,
+            return self._build_short_circuit_result(
+                context=context,
                 verdict="inconclusive",
                 reason="short_circuit:patch_diff_not_found",
-                confidence="low",
                 evidence_summary="Skipped pre/post execution because patch.diff is unavailable.",
             )
         if not context.docker_image_tag:
-            return VerifyResult(
-                pre_patch_triggered=False,
-                post_patch_clean=False,
+            return self._build_short_circuit_result(
+                context=context,
                 verdict="inconclusive",
                 reason="short_circuit:docker_image_tag_missing_in_build_artifact",
-                confidence="low",
                 evidence_summary="Skipped pre/post execution because BuildArtifact has no docker_image_tag.",
             )
+
+        # PoC run_verify 短路：按原因分流
+        if not context.poc_run_verify_eligible:
+            run_verify_reason = (context.poc_run_verify_reason or "").strip()
+            verdict, reason, evidence_summary = self._classify_short_circuit_from_run_verify(run_verify_reason)
+            return self._build_short_circuit_result(
+                context=context,
+                verdict=verdict,
+                reason=reason,
+                evidence_summary=evidence_summary,
+            )
+
         return None
+
+    def _classify_short_circuit_from_run_verify(self, run_verify_reason: str) -> tuple[str, str, str]:
+        """Map run_verify eligibility_reason to (verdict, reason, evidence_summary).
+
+        分流规则：
+        - script_did_not_finish / log_not_well_formed → inconclusive（PoC 自身不可信）
+        - no_target_behavior_observed → failed:pre_not_triggered（短路同意 PoC 的"没触发"判断）
+        - 其他 → inconclusive（兜底保守）
+        """
+        if run_verify_reason.startswith("script_did_not_finish"):
+            return (
+                "inconclusive",
+                "short_circuit:script_did_not_finish",
+                "PoC script did not complete; verify cannot judge based on incomplete evidence.",
+            )
+        if run_verify_reason.startswith("log_not_well_formed"):
+            return (
+                "inconclusive",
+                "short_circuit:log_not_well_formed",
+                "PoC log markers incomplete; verify cannot judge.",
+            )
+        if run_verify_reason.startswith("no_target_behavior_observed"):
+            return (
+                "failed",
+                "short_circuit:pre_not_triggered",
+                "PoC executed cleanly with no expected behavior observed; verify agrees.",
+            )
+        return (
+            "inconclusive",
+            f"short_circuit:unknown_eligibility_reason:{run_verify_reason}",
+            f"Unrecognized run_verify reason ({run_verify_reason}); defaulting to inconclusive.",
+        )
+
+    def _build_short_circuit_result(
+        self,
+        context: VerifyContext,
+        verdict: str,
+        reason: str,
+        evidence_summary: str,
+    ) -> VerifyResult:
+        """Construct a short-circuit VerifyResult (pre/post fields all default).
+
+        与 _build_inconclusive_result 不同：本方法不需要 pre/post dict，
+        用于尚未跑 docker 的短路场景。verdict 可以是 inconclusive 或 failed。
+        pre_patch_triggered 永远是 False——短路时 verify 没真跑 pre，不能声称触发。
+        """
+
+        return VerifyResult(
+            pre_patch_triggered=False,
+            post_patch_clean=False,
+            verdict=verdict,
+            reason=reason,
+            confidence="low",
+            evidence_summary=evidence_summary,
+        )
 
     def _is_triggered(self, pass_result: dict, context: VerifyContext) -> bool:
         """A pass is 'triggered' if any expected behavior is observed."""
 
-        if pass_result.get("matched_error_patterns"):
+        # 兼容期同时支持 matched_error_patterns（旧字段）和 matched_stderr_patterns（新字段）
+        if pass_result.get("matched_error_patterns") or pass_result.get("matched_stderr_patterns"):
+            return True
+        if pass_result.get("matched_stdout_patterns"):
             return True
         if pass_result.get("matched_stack_keywords"):
             return True
@@ -550,9 +615,16 @@ class VerifyStage:
     def _compute_confidence(self, pre: dict, post: dict) -> str:
         """Compute confidence based on signal richness."""
 
-        pre_strong = bool(pre.get("matched_error_patterns")) or bool(pre.get("matched_stack_keywords"))
+        pre_strong = (
+            bool(pre.get("matched_error_patterns"))
+            or bool(pre.get("matched_stderr_patterns"))
+            or bool(pre.get("matched_stdout_patterns"))
+            or bool(pre.get("matched_stack_keywords"))
+        )
         post_silent = (
             not post.get("matched_error_patterns")
+            and not post.get("matched_stderr_patterns")
+            and not post.get("matched_stdout_patterns")
             and not post.get("matched_stack_keywords")
             and not post.get("crash_type")
         )
@@ -631,9 +703,12 @@ class VerifyStage:
         pre_triggered: bool,
         post_clean: bool,
     ) -> VerifyResult:
-        pre_matched_error = list(pre.get("matched_error_patterns") or [])
+        # 优先取 matched_stderr_patterns（新字段），回退到 matched_error_patterns（向后兼容）
+        pre_matched_stderr = list(pre.get("matched_stderr_patterns") or pre.get("matched_error_patterns") or [])
+        pre_matched_stdout = list(pre.get("matched_stdout_patterns") or [])
         pre_matched_stack = list(pre.get("matched_stack_keywords") or [])
-        post_matched_error = list(post.get("matched_error_patterns") or [])
+        post_matched_stderr = list(post.get("matched_stderr_patterns") or post.get("matched_error_patterns") or [])
+        post_matched_stdout = list(post.get("matched_stdout_patterns") or [])
         post_matched_stack = list(post.get("matched_stack_keywords") or [])
 
         patch_apply_log = self._extract_patch_apply_log(post.get("raw_log") or "")
@@ -641,7 +716,7 @@ class VerifyStage:
         return VerifyResult(
             pre_patch_triggered=pre_triggered,
             post_patch_clean=post_clean,
-            matched_error_patterns=pre_matched_error,
+            matched_error_patterns=pre_matched_stderr,
             matched_stack_keywords=pre_matched_stack,
             verdict=verdict,
             reason=reason,
@@ -655,10 +730,14 @@ class VerifyStage:
             post_patch_observed_crash_type=post.get("crash_type") or "",
             pre_patch_log_path=pre.get("log_path") or "",
             post_patch_log_path=post.get("log_path") or "",
-            pre_patch_matched_error_patterns=pre_matched_error,
+            pre_patch_matched_error_patterns=pre_matched_stderr,
             pre_patch_matched_stack_keywords=pre_matched_stack,
-            post_patch_matched_error_patterns=post_matched_error,
+            post_patch_matched_error_patterns=post_matched_stderr,
             post_patch_matched_stack_keywords=post_matched_stack,
+            pre_patch_matched_stdout_patterns=pre_matched_stdout,
+            pre_patch_matched_stderr_patterns=pre_matched_stderr,
+            post_patch_matched_stdout_patterns=post_matched_stdout,
+            post_patch_matched_stderr_patterns=post_matched_stderr,
             patch_apply_log=patch_apply_log,
             patch_apply_success=patch_apply_success,
             confidence=confidence,

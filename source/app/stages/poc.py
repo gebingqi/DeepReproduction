@@ -141,7 +141,11 @@ class RunVerifyReport(BaseModel):
     )
     error_pattern_hits: list[str] = Field(
         default_factory=list,
-        description="实际命中的 expected_stderr_patterns 列表。",
+        description="实际命中的 expected_stderr_patterns 列表（仅指 stderr 流命中）。",
+    )
+    stdout_pattern_hits: list[str] = Field(
+        default_factory=list,
+        description="实际命中的 expected_stdout_patterns 列表。",
     )
     stack_keyword_hits: list[str] = Field(
         default_factory=list,
@@ -539,14 +543,22 @@ class PocStage:
         observation = self._extract_execution_observation(execution_logs)
         crash_report = observation["observed_stderr"] or observation["observed_stdout"]
         self.file_tool.write_text(str(paths.crash_report), crash_report)
-        matched_error_patterns = self._match_patterns(
-            observation["observed_stdout"] + "\n" + observation["observed_stderr"],
+        # stdout 模式只在 stdout 找；stderr 模式只在 stderr 找；
+        # stack keywords 在合并文本里找（栈帧可能落在任一流）。
+        matched_stdout_patterns = self._match_patterns(
+            observation["observed_stdout"],
+            plan.expected_stdout_patterns,
+        )
+        matched_stderr_patterns = self._match_patterns(
+            observation["observed_stderr"],
             plan.expected_stderr_patterns,
         )
         matched_stack_keywords = self._match_patterns(
             observation["observed_stdout"] + "\n" + observation["observed_stderr"],
             plan.expected_stack_keywords,
         )
+        # matched_error_patterns 与 matched_stderr_patterns 同步，向后兼容
+        matched_error_patterns = list(matched_stderr_patterns)
 
         execution_success = docker_build_result.success and bool(run_result.success)
         run_verify_report = self._build_run_verify_report(
@@ -554,6 +566,7 @@ class PocStage:
             observation=observation,
             execution_logs=execution_logs,
             matched_error_patterns=matched_error_patterns,
+            matched_stdout_patterns=matched_stdout_patterns,
             matched_stack_keywords=matched_stack_keywords,
         )
         self.file_tool.safe_persist(
@@ -587,6 +600,8 @@ class PocStage:
             observed_stderr=observation["observed_stderr"],
             observed_crash_type=observation["observed_crash_type"],
             matched_error_patterns=matched_error_patterns,
+            matched_stdout_patterns=matched_stdout_patterns,
+            matched_stderr_patterns=matched_stderr_patterns,
             matched_stack_keywords=matched_stack_keywords,
             reproducer_verified=reproducer_verified,
             execution_success=execution_success,
@@ -614,7 +629,7 @@ class PocStage:
                 yaml.safe_dump(plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
             )
             artifact = self._execute_poc_plan(paths=paths, plan_meta=plan_meta, plan=plan)
-            if artifact.execution_success or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
+            if (artifact.execution_success and artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
                 break
             replanned = self.replan_after_failure(
                 knowledge=knowledge,
@@ -630,7 +645,7 @@ class PocStage:
                     yaml.safe_dump(replanned.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
                 )
                 artifact = self._execute_poc_plan(paths=paths, plan_meta=plan_meta, plan=replanned)
-                if artifact.execution_success or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
+                if (artifact.execution_success and artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
                     break
             current_context = current_context.model_copy(
                 update={
@@ -944,6 +959,7 @@ class PocStage:
         execution_logs: str,
         matched_error_patterns: list[str],
         matched_stack_keywords: list[str],
+        matched_stdout_patterns: Optional[list[str]] = None,
     ) -> RunVerifyReport:
         """Compute the minimum-eligibility report for one PoC execution."""
 
@@ -962,6 +978,7 @@ class PocStage:
 
         # 3.5 hits
         error_pattern_hits = list(matched_error_patterns)
+        stdout_pattern_hits = list(matched_stdout_patterns or [])
         stack_keyword_hits = list(matched_stack_keywords)
 
         # 3.6 crash_type_hit
@@ -993,9 +1010,13 @@ class PocStage:
         elif not log_well_formed:
             eligibility_reason = "log_not_well_formed: stdout/stderr block markers missing"
         else:
+            # Priority: stderr > stdout > stack > crash_type > exit_code
             if error_pattern_hits:
                 eligible_for_verify = True
                 eligibility_reason = f"error_pattern_hit: {error_pattern_hits[0]}"
+            elif stdout_pattern_hits:
+                eligible_for_verify = True
+                eligibility_reason = f"stdout_pattern_hit: {stdout_pattern_hits[0]}"
             elif stack_keyword_hits:
                 eligible_for_verify = True
                 eligibility_reason = f"stack_keyword_hit: {stack_keyword_hits[0]}"
@@ -1028,6 +1049,7 @@ class PocStage:
             target_binary_invoked=target_binary_invoked,
             exit_code_observed=exit_code_observed,
             error_pattern_hits=error_pattern_hits,
+            stdout_pattern_hits=stdout_pattern_hits,
             stack_keyword_hits=stack_keyword_hits,
             crash_type_hit=crash_type_hit,
             crash_type_compatible=crash_type_compatible,
@@ -1063,7 +1085,8 @@ def poc_node(state):
 
     try:
         poc = stage.run(knowledge=knowledge, build=build, workspace=workspace)
-        if poc.execution_success:
+
+        if poc.execution_success and poc.reproducer_verified:
             history.append({"stage": "poc", "status": "success"})
             return {
                 "poc": poc,
@@ -1072,6 +1095,21 @@ def poc_node(state):
                 "last_error": None,
             }
 
+        if poc.execution_success and not poc.reproducer_verified:
+            # 脚本跑通了但没打到目标行为；仍然推进 verify，让 verify 独立判定（任务 0 H5）
+            history.append({
+                "stage": "poc",
+                "status": "executed_but_unverified",
+                "note": "PoC executed but no expected behavior observed; deferring to verify for independent judgment",
+            })
+            return {
+                "poc": poc,
+                "current_stage": "verify",
+                "stage_history": history,
+                "last_error": None,
+            }
+
+        # execution_success=False
         retry_count["poc"] = retry_count.get("poc", 0) + 1
         history.append({"stage": "poc", "status": "failed", "error": poc.execution_logs})
         return {

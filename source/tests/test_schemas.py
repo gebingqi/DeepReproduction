@@ -17,3 +17,18 @@ def test_poc_artifact_loads_legacy_payload_without_new_fields():
     assert artifact.environment_variables == {}
     assert artifact.expected_stack_keywords == []
     assert artifact.expected_crash_type == ""
+
+
+def test_poc_artifact_legacy_matched_error_patterns_preserved():
+    """Fix 1.D: 老 yaml 只有 matched_error_patterns 时，新字段 matched_stdout/stderr_patterns 用默认值，
+    matched_error_patterns 自身不被破坏。"""
+
+    artifact = PoCArtifact(
+        poc_filename="poc.lua",
+        poc_content="...",
+        run_script_content="...",
+        matched_error_patterns=["foo"],
+    )
+    assert artifact.matched_stdout_patterns == []
+    assert artifact.matched_stderr_patterns == []
+    assert artifact.matched_error_patterns == ["foo"]
